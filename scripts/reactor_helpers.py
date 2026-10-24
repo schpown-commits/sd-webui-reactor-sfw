@@ -190,12 +190,24 @@ def get_models():
     return models_names
 
 def load_face_model(filename: str):
+    from scripts.reactor_logger import logger
     face = {}
     model_path = os.path.join(FACE_MODELS_PATH, filename)
-    with safe_open(model_path, framework="pt") as f:
-        for k in f.keys():
-            face[k] = f.get_tensor(k).numpy()
-    return Face(face)
+    if not os.path.exists(model_path) and not filename.endswith(".safetensors"):
+        alt_path = model_path + ".safetensors"
+        if os.path.exists(alt_path):
+            model_path = alt_path
+    if not os.path.exists(model_path):
+        logger.error(f"Face model file not found: {model_path}")
+        return None
+    try:
+        with safe_open(model_path, framework="pt") as f:
+            for k in f.keys():
+                face[k] = f.get_tensor(k).numpy()
+        return Face(face)
+    except Exception as e:
+        logger.error("Error loading face model %s: %s", filename, e)
+        return None
 
 def get_facemodels():
     models_path = os.path.join(FACE_MODELS_PATH, "*")

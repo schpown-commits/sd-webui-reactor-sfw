@@ -4,9 +4,12 @@ from PIL import Image
 
 from typing import List
 
-import modules.scripts as scripts
+from modules import scripts, shared, images
 from modules.upscaler import Upscaler, UpscalerData
-from modules import scripts, shared, images, scripts_postprocessing
+try:
+    from modules import scripts_postprocessing
+except ImportError:
+    scripts_postprocessing = None
 from modules.processing import (
     Processed,
     StableDiffusionProcessing,
@@ -53,6 +56,17 @@ except:
 def check_old_webui():
     return NO_IA
 
+import re
+
+def parse_face_indices(val) -> list[int]:
+    if isinstance(val, list):
+        return [int(x) for x in val if str(x).isdigit()]
+    if isinstance(val, int):
+        return [val]
+    nums = re.findall(r'\d+', str(val))
+    return [int(x) for x in nums] if nums else [0]
+
+
 
 class FaceSwapScript(scripts.Script):
     def title(self):
@@ -77,10 +91,10 @@ class FaceSwapScript(scripts.Script):
             msgs: dict = {
                 "extra_multiple_source": "",
             }
-            img, imgs, selected_tab, select_source, face_model, source_folder, save_original, mask_face, source_faces_index, gender_source, faces_index, gender_target, face_restorer_name, face_restorer_visibility, codeformer_weight, swap_in_source, swap_in_generated, random_image = ui_main.show(is_img2img=is_img2img, **msgs)
+            img, imgs, selected_tab, select_source, face_model, source_folder, save_original, mask_face, source_faces_index, gender_source, faces_index, gender_target, face_restorer_name, face_restorer_visibility, codeformer_weight, swap_in_source, swap_in_generated, random_image, simultaneous_swap, blend_source_embeddings = ui_main.show(is_img2img=is_img2img, **msgs)
             
             # TAB DETECTION
-            det_thresh, det_maxnum = ui_detection.show()
+            det_thresh, det_maxnum, face_sort_mode, mask_dilation, mask_blur, color_correction = ui_detection.show()
             
             # TAB UPSCALE
             restore_first, upscaler_name, upscaler_scale, upscaler_visibility, upscale_force = ui_upscale.show()
@@ -91,7 +105,7 @@ class FaceSwapScript(scripts.Script):
             # TAB SETTINGS
             model, device, console_logging_level, source_hash_check, target_hash_check = ui_settings.show()
             
-            gr.Markdown("<span style='display:block;text-align:right;padding:3px;font-size:0.666em;margin-bottom:-12px;'>by <a style='font-weight:normal' href='https://github.com/Gourieff' target='_blank'>Eugene Gourieff</a></span>")
+            gr.Markdown("<span style='display:block;text-align:right;padding:3px;font-size:0.85em;margin-bottom:-12px;'>by <a style='font-weight:normal;text-decoration:underline;' href='https://github.com/Gourieff' target='_blank' aria-label='Author Eugene Gourieff GitHub'>Eugene Gourieff</a></span>")
 
         return [
             img,
@@ -125,6 +139,12 @@ class FaceSwapScript(scripts.Script):
             det_thresh,
             det_maxnum,
             selected_tab,
+            simultaneous_swap,
+            face_sort_mode,
+            blend_source_embeddings,
+            mask_dilation,
+            mask_blur,
+            color_correction,
         ]
 
 
@@ -159,7 +179,11 @@ class FaceSwapScript(scripts.Script):
     def detection_options(self) -> DetectionOptions:
         return DetectionOptions(
             det_thresh=self.det_thresh,
-            det_maxnum=self.det_maxnum
+            det_maxnum=self.det_maxnum,
+            face_sort_mode=self.face_sort_mode,
+            mask_dilation=self.mask_dilation,
+            mask_blur=self.mask_blur,
+            color_correction=self.color_correction,
         )
 
     def process(
@@ -196,6 +220,12 @@ class FaceSwapScript(scripts.Script):
         det_thresh,
         det_maxnum,
         selected_tab,
+        simultaneous_swap,
+        face_sort_mode,
+        blend_source_embeddings,
+        mask_dilation,
+        mask_blur,
+        color_correction,
     ):
         self.enable = enable
         if self.enable:
@@ -240,20 +270,19 @@ class FaceSwapScript(scripts.Script):
             self.upscale_force = upscale_force
             self.det_thresh=det_thresh
             self.det_maxnum=det_maxnum
+            self.simultaneous_swap = simultaneous_swap
+            self.face_sort_mode = face_sort_mode
+            self.blend_source_embeddings = blend_source_embeddings
+            self.mask_dilation = mask_dilation
+            self.mask_blur = mask_blur
+            self.color_correction = color_correction
             if self.gender_source is None or self.gender_source == "No":
                 self.gender_source = 0
             if self.gender_target is None or self.gender_target == "No":
                 self.gender_target = 0
-            self.source_faces_index = [
-                int(x) for x in source_faces_index.strip().replace(" ", "").strip(",").split(",") if x.isnumeric()
-            ]
-            self.faces_index = [
-                int(x) for x in faces_index.strip().replace(" ", "").strip(",").split(",") if x.isnumeric()
-            ]
-            if len(self.source_faces_index) == 0:
-                self.source_faces_index = [0]
-            if len(self.faces_index) == 0:
-                self.faces_index = [0]
+            self.source_faces_index = parse_face_indices(source_faces_index)
+            self.faces_index = parse_face_indices(faces_index)
+            self.swapped_in_postprocess_image = False
             if self.save_original is None:
                 self.save_original = False
             if self.source_hash_check is None:
@@ -280,7 +309,7 @@ class FaceSwapScript(scripts.Script):
             if (self.save_original is None or not self.save_original) and (self.select_source == 2 or self.source_imgs is not None):
                 p.do_not_save_samples = True
             
-            if ((self.source is not None or self.source_imgs is not None) and self.select_source == 0) or ((self.face_model is not None and self.face_model != "None") and self.select_source == 1) or ((self.source_folder is not None and self.source_folder != "") and self.select_source == 2):
+            if ((self.source is not None or self.source_imgs is not None) and self.select_source == 0) or ((self.face_model is not None and (self.face_model != "None" if not isinstance(self.face_model, list) else len([m for m in self.face_model if m not in (None, "None")]) > 0)) and self.select_source == 1) or ((self.source_folder is not None and self.source_folder != "") and self.select_source == 2):
                 logger.debug("*** Log patch")
                 apply_logging_patch(console_logging_level)
                 
@@ -308,12 +337,14 @@ class FaceSwapScript(scripts.Script):
                             mask_face=self.mask_face,
                             select_source=self.select_source,
                             face_model = self.face_model,
-                            source_folder = None,
-                            source_imgs = None,
-                            random_image = False,
+                            source_folder = self.source_folder,
+                            source_imgs = self.source_imgs,
+                            random_image = self.random_image,
                             detection_options=self.detection_options,
+                            simultaneous_swap=self.simultaneous_swap,
+                            blend_source_embeddings=self.blend_source_embeddings,
                         )
-                        p.init_images[i] = result
+                        p.init_images[i] = result[0] if isinstance(result, list) else result
                         # result_path = get_image_path(p.init_images[i], p.outpath_samples, "", p.all_seeds[i], p.all_prompts[i], "txt", p=p, suffix="-swapped")
                         # if len(output) != 0:
                         #     with open(result_path, 'w', encoding="utf8") as f:
@@ -347,7 +378,7 @@ class FaceSwapScript(scripts.Script):
                 result_images: List = processed.images
                 # result_info: List = processed.infotexts
 
-                if self.swap_in_generated:
+                if self.swap_in_generated and not getattr(self, 'swapped_in_postprocess_image', False):
 
                     logger.status("Working: source face index %s, target face index %s", self.source_faces_index, self.faces_index)
 
@@ -380,31 +411,41 @@ class FaceSwapScript(scripts.Script):
                             source_imgs = self.source_imgs,
                             random_image = self.random_image,
                             detection_options=self.detection_options,
+                            simultaneous_swap=self.simultaneous_swap,
+                            blend_source_embeddings=self.blend_source_embeddings,
                         )
 
                         if self.select_source == 2 or (self.select_source == 0 and self.source_imgs is not None and self.source is None):
-                            if len(result) > 0 and swapped > 0:
-                                # result_images.extend(result)
+                            res_list = result if isinstance(result, list) else [result]
+                            if len(res_list) > 0 and swapped > 0:
                                 if self.save_original:
-                                    result_images.extend(result)
+                                    result_images.extend(res_list)
                                 else:
-                                    result_images = result
+                                    result_images = res_list
                                 suffix = "-swapped"
-                                for i,x in enumerate(result):
+                                for idx_r, x in enumerate(res_list):
                                     try:
-                                        img_path = save_image(result[i], p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0], "png", info=info, p=p, suffix=suffix)
+                                        img_path = save_image(x, p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0], "png", info=info, p=p, suffix=suffix)
                                     except:
                                         logger.error("Cannot save a result image - please, check SD WebUI Settings (Saving and Paths)")
 
-                            elif len(result) == 0:
+                            elif len(res_list) == 0:
                                 logger.error("Cannot create a result image")
 
                         else:
                             if result is not None and swapped > 0:
-                                result_images.append(result)
+                                res_img = result[0] if isinstance(result, list) else result
+                                if self.save_original:
+                                    result_images.append(res_img)
+                                else:
+                                    target_idx = processed.index_of_first_image + i
+                                    if target_idx < len(result_images):
+                                        result_images[target_idx] = res_img
+                                    else:
+                                        result_images.append(res_img)
                                 suffix = "-swapped"
                                 try:
-                                    img_path = save_image(result, p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0], "png", info=info, p=p, suffix=suffix)
+                                    img_path = save_image(res_img, p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0], "png", info=info, p=p, suffix=suffix)
                                 except:
                                     logger.error("Cannot save a result image - please, check SD WebUI Settings (Saving and Paths)")
                             elif result is None:
@@ -481,13 +522,20 @@ class FaceSwapScript(scripts.Script):
                 source_imgs = None,
                 random_image = False,
                 detection_options=self.detection_options,
+                simultaneous_swap=self.simultaneous_swap,
+                blend_source_embeddings=self.blend_source_embeddings,
             )
             self.result = result
+            self.swapped_in_postprocess_image = True
             try:
-                pp = scripts_postprocessing.PostprocessedImage(result)
-                pp.info = {}
-                p.extra_generation_params.update(pp.info)
-                script_pp.image = pp.image
+                res_img = result if isinstance(result, Image.Image) else result[0]
+                if scripts_postprocessing is not None:
+                    pp = scripts_postprocessing.PostprocessedImage(res_img)
+                    pp.info = {}
+                    p.extra_generation_params.update(pp.info)
+                    script_pp.image = pp.image
+                else:
+                    script_pp.image = res_img
 
                 # if len(output) != 0:
                 #     result_path = get_image_path(script_pp.image, p.outpath_samples, "", p.all_seeds[0], p.all_prompts[0], "txt", p=p, suffix="-swapped")
@@ -498,7 +546,9 @@ class FaceSwapScript(scripts.Script):
                 logger.error("Cannot create a result image")
 
 
-class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
+# Conditional class definition: only register Extras tab if scripts_postprocessing is available
+if scripts_postprocessing is not None:
+  class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
     name = 'ReActor'
     order = 20000
 
@@ -520,10 +570,10 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
             msgs: dict = {
                 "extra_multiple_source": "",
             }
-            img, imgs, selected_tab, select_source, face_model, source_folder, save_original, mask_face, source_faces_index, gender_source, faces_index, gender_target, face_restorer_name, face_restorer_visibility, codeformer_weight, swap_in_source, swap_in_generated, random_image = ui_main.show(is_img2img=False, show_br=False, **msgs)
+            img, imgs, selected_tab, select_source, face_model, source_folder, save_original, mask_face, source_faces_index, gender_source, faces_index, gender_target, face_restorer_name, face_restorer_visibility, codeformer_weight, swap_in_source, swap_in_generated, random_image, simultaneous_swap, blend_source_embeddings = ui_main.show(is_img2img=False, show_br=False, **msgs)
             
             # TAB DETECTION
-            det_thresh, det_maxnum = ui_detection.show()
+            det_thresh, det_maxnum, face_sort_mode, mask_dilation, mask_blur, color_correction = ui_detection.show()
             
             # TAB UPSCALE
             restore_first, upscaler_name, upscaler_scale, upscaler_visibility, upscale_force = ui_upscale.show(show_br=False)
@@ -534,7 +584,7 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
             # TAB SETTINGS
             model, device, console_logging_level, source_hash_check, target_hash_check = ui_settings.show(hash_check_block=False)
                         
-            gr.Markdown("<span style='display:block;text-align:right;padding-right:3px;font-size:0.666em;margin: -9px 0'>by <a style='font-weight:normal' href='https://github.com/Gourieff' target='_blank'>Eugene Gourieff</a></span>")
+            gr.Markdown("<span style='display:block;text-align:right;padding-right:3px;font-size:0.85em;margin: -9px 0'>by <a style='font-weight:normal;text-decoration:underline;' href='https://github.com/Gourieff' target='_blank' aria-label='Author Eugene Gourieff GitHub'>Eugene Gourieff</a></span>")
 
         args = {
             'img': img,
@@ -563,6 +613,12 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
             'det_thresh': det_thresh,
             'det_maxnum': det_maxnum,
             'selected_tab': selected_tab,
+            'simultaneous_swap': simultaneous_swap,
+            'face_sort_mode': face_sort_mode,
+            'blend_source_embeddings': blend_source_embeddings,
+            'mask_dilation': mask_dilation,
+            'mask_blur': mask_blur,
+            'color_correction': color_correction,
         }
         return args
 
@@ -597,7 +653,11 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
     def detection_options(self) -> DetectionOptions:
         return DetectionOptions(
             det_thresh=self.det_thresh,
-            det_maxnum=self.det_maxnum
+            det_maxnum=self.det_maxnum,
+            face_sort_mode=self.face_sort_mode,
+            mask_dilation=self.mask_dilation,
+            mask_blur=self.mask_blur,
+            color_correction=self.color_correction,
         )
 
     def process(self, pp: scripts_postprocessing.PostprocessedImage, **args):
@@ -635,20 +695,18 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
             self.upscale_force = args['upscale_force']
             self.det_thresh = args['det_thresh']
             self.det_maxnum = args['det_maxnum']
+            self.simultaneous_swap = args.get('simultaneous_swap', False)
+            self.face_sort_mode = args.get('face_sort_mode', "Left-to-Right")
+            self.blend_source_embeddings = args.get('blend_source_embeddings', False)
+            self.mask_dilation = args.get('mask_dilation', 0)
+            self.mask_blur = args.get('mask_blur', 0)
+            self.color_correction = args.get('color_correction', False)
             if self.gender_source is None or self.gender_source == "No":
                 self.gender_source = 0
             if self.gender_target is None or self.gender_target == "No":
                 self.gender_target = 0
-            self.source_faces_index = [
-                int(x) for x in args['source_faces_index'].strip(",").split(",") if x.isnumeric()
-            ]
-            self.faces_index = [
-                int(x) for x in args['faces_index'].strip(",").split(",") if x.isnumeric()
-            ]
-            if len(self.source_faces_index) == 0:
-                self.source_faces_index = [0]
-            if len(self.faces_index) == 0:
-                self.faces_index = [0]
+            self.source_faces_index = parse_face_indices(args['source_faces_index'])
+            self.faces_index = parse_face_indices(args['faces_index'])
             if self.mask_face is None:
                 self.mask_face = False
             if self.random_image is None:
@@ -665,7 +723,7 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
 
             logger.debug("We're here: process() 1")
             
-            if (self.source is not None and self.select_source == 0) or ((self.face_model is not None and self.face_model != "None") and self.select_source == 1) or ((self.source_folder is not None and self.source_folder != "") and self.select_source == 2) or ((self.source_imgs is not None and self.source is None) and self.select_source == 0):
+            if (self.source is not None and self.select_source == 0) or ((self.face_model is not None and (self.face_model != "None" if not isinstance(self.face_model, list) else len([m for m in self.face_model if m not in (None, "None")]) > 0)) and self.select_source == 1) or ((self.source_folder is not None and self.source_folder != "") and self.select_source == 2) or ((self.source_imgs is not None and self.source is None) and self.select_source == 0):
 
                 logger.debug("We're here: process() 2")
 
@@ -704,6 +762,8 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
                     source_imgs=self.source_imgs,
                     random_image=self.random_image,
                     detection_options=self.detection_options,
+                    simultaneous_swap=self.simultaneous_swap,
+                    blend_source_embeddings=self.blend_source_embeddings,
                 )
                 if self.select_source == 2 or (self.select_source == 0 and self.source_imgs is not None and self.source is None):
                     if len(result) > 0 and swapped > 0:
@@ -725,13 +785,14 @@ class FaceSwapScriptExtras(scripts_postprocessing.ScriptPostprocessing):
                     try:
                         pp.info["ReActor"] = True
 
+                        res_img = result[0] if isinstance(result, list) else result
                         if alpha is not None:
-                            logger.debug(f"result = {result}")
-                            result = result.convert("RGBA")
-                            result.putalpha(alpha)
-                            logger.debug(f"result_alpha = {result}")
+                            logger.debug(f"result = {res_img}")
+                            res_img = res_img.convert("RGBA")
+                            res_img.putalpha(alpha)
+                            logger.debug(f"result_alpha = {res_img}")
 
-                        pp.image = result
+                        pp.image = res_img
                         logger.status("---Done!---")
                     except Exception:
                         logger.error("Cannot create a result image")

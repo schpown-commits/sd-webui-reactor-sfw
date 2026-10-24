@@ -50,7 +50,7 @@ def process_face_image(
         return Image.fromarray(output)
 
 
-def apply_face_mask(swapped_image:np.ndarray,target_image:np.ndarray,target_face,entire_mask_image:np.array)->np.ndarray:
+def apply_face_mask(swapped_image:np.ndarray,target_image:np.ndarray,target_face,entire_mask_image:np.array, mask_dilation: int = 0, mask_blur: int = 0)->np.ndarray:
     logger.status("Correcting Face Mask")
     mask_generator =  BiSeNetMaskGenerator()
     face = FaceArea(target_image,Rect.from_ndarray(np.array(target_face.bbox)),1.6,512,"")
@@ -64,13 +64,26 @@ def apply_face_mask(swapped_image:np.ndarray,target_image:np.ndarray,target_face
         mask_size=0,
         use_minimal_area=True
     )
-    mask = cv2.blur(mask, (12, 12))
+    if mask_dilation != 0:
+        kernel_size = abs(mask_dilation) * 2 + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        if mask_dilation > 0:
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        else:
+            mask = cv2.erode(mask, kernel, iterations=1)
+
+    blur_val = 12 if mask_blur <= 0 else mask_blur
+    mask = cv2.blur(mask, (blur_val, blur_val))
     # """entire_mask_image = np.zeros_like(target_image)"""
     larger_mask = cv2.resize(mask, dsize=(face.width, face.height))
+    if len(larger_mask.shape) == 2 and len(entire_mask_image.shape) == 3:
+        larger_mask = cv2.cvtColor(larger_mask, cv2.COLOR_GRAY2BGR)
+    elif len(larger_mask.shape) == 3 and len(entire_mask_image.shape) == 2:
+        larger_mask = cv2.cvtColor(larger_mask, cv2.COLOR_BGR2GRAY)
     entire_mask_image[
         face.top : face.bottom,
         face.left : face.right,
-    ] = larger_mask
+    ] = np.maximum(entire_mask_image[face.top : face.bottom, face.left : face.right], larger_mask)
    
     result = Image.composite(Image.fromarray(swapped_image),Image.fromarray(target_image), Image.fromarray(entire_mask_image).convert("L"))
     return np.array(result)

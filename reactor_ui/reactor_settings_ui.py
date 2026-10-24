@@ -2,6 +2,7 @@ import gradio as gr
 from scripts.reactor_logger import logger
 from scripts.reactor_helpers import get_models, set_Device
 from scripts.reactor_globals import DEVICE, DEVICE_LIST
+from scripts.reactor_compat import gr_update, tool_variant
 try:
     import torch.cuda as cuda
     EP_is_visible = True if cuda.is_available() else False
@@ -9,9 +10,7 @@ except:
     EP_is_visible = False
 
 def update_models_list(selected: str):
-    return gr.Dropdown.update(
-        value=selected, choices=get_models()
-    )
+    return gr_update(gr.Dropdown, value=selected, choices=get_models())
 
 def show(hash_check_block: bool = True):
     # TAB SETTINGS
@@ -49,7 +48,9 @@ def show(hash_check_block: bool = True):
                 )
             models_update = gr.Button(
                 value="🔄",
-                variant="tool",
+                variant=tool_variant(),
+                elem_id="reactor_refresh_models_btn",
+                tooltip="Refresh Face Swapper Models List",
             )
             models_update.click(
                 update_models_list, 
